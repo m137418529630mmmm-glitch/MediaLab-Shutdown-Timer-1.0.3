@@ -1,0 +1,111 @@
+name: Build Medialab Shutdown Timer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows EXE and MSI
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Find logo-fixed project ZIP
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter "*.zip" -File -Recurse |
+            Where-Object { $_.Name -like "Medialab-Shutdown-Timer-Logo-Fixed*.zip" } |
+            Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "Upload Medialab-Shutdown-Timer-Logo-Fixed.zip to the repository root." -ForegroundColor Red
+            Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter "*.zip" -File -Recurse | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+          "PROJECT_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Using project ZIP: $($zip.FullName)"
+
+      - name: Extract project
+        shell: pwsh
+        run: |
+          $projectPath = "$env:GITHUB_WORKSPACE/app"
+          if (Test-Path $projectPath) { Remove-Item $projectPath -Recurse -Force }
+          New-Item -ItemType Directory -Path $projectPath -Force | Out-Null
+          Expand-Archive -Path "$env:PROJECT_ZIP" -DestinationPath $projectPath -Force
+          "PROJECT_ROOT=$projectPath" >> $env:GITHUB_ENV
+
+      - name: Verify project
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          $required = @(
+            "package.json",
+            "src/App.tsx",
+            "src/components/CustomLogoUploader.tsx",
+            "src/assets/medialab-publishing.png",
+            "src/utils/native.ts",
+            "src-tauri/Cargo.toml",
+            "src-tauri/build.rs",
+            "src-tauri/tauri.conf.json",
+            "src-tauri/src/lib.rs",
+            "src-tauri/src/main.rs",
+            "src-tauri/icons/icon.ico"
+          )
+          $failed = $false
+          foreach ($file in $required) {
+            if (Test-Path $file) { Write-Host "[OK] $file" -ForegroundColor Green }
+            else { Write-Host "[MISSING] $file" -ForegroundColor Red; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Install npm dependencies
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: npm install --legacy-peer-deps
+
+      - name: Build frontend
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: npm run build
+
+      - name: Build Windows installers
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: npm exec tauri -- build --bundles nsis,msi
+
+      - name: Verify installers
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          $msi = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
+          if (-not $exe) { Write-Error "NSIS EXE installer was not created."; exit 1 }
+          if (-not $msi) { Write-Error "MSI installer was not created."; exit 1 }
+          $exe | ForEach-Object { Write-Host "EXE: $($_.FullName)" }
+          $msi | ForEach-Object { Write-Host "MSI: $($_.FullName)" }
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: Medialab-Shutdown-Timer-Windows
+          path: |
+            app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 30
